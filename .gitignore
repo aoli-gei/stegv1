@@ -1,0 +1,5 @@
+# 忽略文件
+
+model/
+__pycache__/
+runs/
