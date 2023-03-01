@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
@@ -97,9 +98,43 @@ class Transformer(nn.Module):
         return x
 
 
+class SE_block(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.FC = nn.Linear(in_channels, in_channels)
+
+    def forward(self, img):
+        b, c, _, _ = img.shape
+        sequeeze = F.adaptive_avg_pool2d(img, (b, c))
+        attention_weight = F.sigmoid(self.FC(sequeeze))
+        attention_out = attention_weight*img
+        return attention_out
+
+
+class bottleneck_block(nn.Module):
+    """
+        感觉该模型通道数不是很多，直接提升通道
+    """
+
+    def __init__(self, in_channels, bottle_dim):
+        super().__init__()
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(in_channels=in_channels, out_channels=bottle_dim, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=bottle_dim, out_channels=bottle_dim, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=bottle_dim, out_channels=in_channels, kernel_size=1, stride=0, padding=0)
+        )
+
+    def forward(self, img):
+        x = self.bottleneck(img)
+        return img+x
+
+
 class stg_block(nn.Module):
     def __init__(self, *, image_size, patch_size, dim, heads, mlp_dim, channels=3, dim_head=64, dropout=0., emb_dropout=0.):
         """
+            最小模块，由 Transformer 分支以及 CNN 分支组成，输入为激活图 (B,C,H,W)，CNN 分支使用 SENet 做通道注意力
             image_size: 输入图像大小
             patch_size: patch size
             dim: token's length
@@ -122,20 +157,60 @@ class stg_block(nn.Module):
         )
         self.cnn_blcok = nn.Sequential(
             nn.Conv2d(in_channels=2*channels, out_channels=4*channels, kernel_size=3, stride=2, padding=1),  # 特征通道数翻倍，分辨率减半
-            nn.ReLU(),
             nn.BatchNorm2d(num_features=4*channels),
-            nn.ConvTranspose2d(in_channels=4*channels, out_channels=2*channels, kernel_size=3, stride=2, padding=1,output_padding=1),   # 恢复分辨率
+            nn.ReLU(),
+            nn.ConvTranspose2d(in_channels=4*channels, out_channels=2*channels, kernel_size=3, stride=2, padding=1, output_padding=1),   # 恢复分辨率
             nn.ReLU(),
         )
 
     def forward(self, img):
-        img_token = rearrange(img, 'b (n c) (h p1) (w p2) -> b (n h w) (p1 p2 c)',n=2,p1=self.patch_size,p2=self.patch_size)  # 转为 Token（B,2N,L)n:图像数量，h：纵向patch数量，w：横向patch数量，c：通道数
-        transformer_output=self.transformer_block(img_token)    # Transformer输出
-        transformer_output=rearrange(transformer_output,'b (n h w) (p1 p2 c) -> b (n c) (h p1) (w p2)', n=2,h=self.proportion,p1=self.patch_size,p2=self.patch_size)    # 转为图像表示
+        img_token = rearrange(img, 'b (n c) (h p1) (w p2) -> b (n h w) (p1 p2 c)', n=2, p1=self.patch_size,
+                              p2=self.patch_size)  # 转为 Token（B,2N,L)n:图像数量，h：纵向patch数量，w：横向patch数量，c：通道数
+        transformer_output = self.transformer_block(img_token)    # Transformer输出
+        transformer_output = rearrange(transformer_output, 'b (n h w) (p1 p2 c) -> b (n c) (h p1) (w p2)', n=2,
+                                       h=self.proportion, p1=self.patch_size, p2=self.patch_size)    # 转为图像表示
         cnn_output = self.cnn_blcok(img)    # CNN 输出
-        res_output=cnn_output+transformer_output+img    # 残差连接
+        res_output = cnn_output+transformer_output+img    # 残差连接
         return res_output
 
+
+class UNet_block(nn.Module):
+    def __init__(self, *, image_size, patch_size, dim, heads, mlp_dim, channels=3, dim_head=64, dropout=0., emb_dropout=0.):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for i in range(2):
+            self.layers.add_module(stg_block(image_size=image_size, patch_size=patch_size, dim=dim,
+                                   heads=heads, mlp_dim=mlp_dim, channels=channels, dim_head=dim_head))
+
+    def forward(self, img):
+        for layer in self.layers:
+            img = layer(img)
+        return img
+
+
+class UNet(nn.Module):
+    def __init(self, *, image_size, patch_size, dim, heads, mlp_dim, in_channel, out_channel=3, channels=3, dim_head=64, dropout=0., emb_dropout=0.):
+        """
+            构造 U-Net 网络
+            image_size: 输入图像大小
+            patch_size: patch size
+            dim: token's length
+            heads: numbers of multi-attention head
+            mlp_dim: mlp's dim
+            dim_head: one of the head's dim
+            channels:每张图片的通道数！！！ 
+        """
+        super().__init__()
+        filter = [in_channel, in_channel*2, in_channel*4]
+        self.down_conv1 = nn.Conv2d(in_channels=filter[0], out_channels=filter[1], kernel_size=3, stride=2, padding=1)
+        self.down_conv2 = nn.Conv2d(in_channels=filter[1], out_channels=filter[2], kernel_size=3, stride=2, padding=1)
+        self.up_conv1 = nn.ConvTranspose2d(in_channels=filter[3], out_channels=filter[2], kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.up_conv2 = nn.ConvTranspose2d(in_channels=filter[2], out_channels=filter[1], kernel_size=3, stride=2, padding=1, output_padding=1)
+
+
+        self.block1=UNet_block(image_size=image_size,patch_size=8,dim=8**2*filter[0],heads=8,mlp_dim=8**2*filter[0]*2,dim_head=8*filter[0]*2)
+        self.block2=UNet_block(image_size=image_size,patch_size=8,dim=8**2*filter[0],heads=8,mlp_dim=8**2*filter[0]*2,dim_head=8*filter[0]*2)
+        # 写到这里
 
 
 class model1_encoder(nn.Module):
@@ -166,16 +241,10 @@ class model1_encoder(nn.Module):
             nn.Linear(patch_dim, dim),
             nn.LayerNorm(dim),
         )
-        self.pos_embedding = nn.Parameter(
-            torch.randn(1, num_patches, dim))  # 位置嵌入是可学习的
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches, dim))  # 位置嵌入是可学习的
         self.dropout = nn.Dropout(emb_dropout)
-
-        self.transformer = Transformer(
-            dim, depth, heads, dim_head, mlp_dim, dropout)
-
-        self.feature_extractor = nn.Conv2d(
-            in_channels=channels*2, out_channels=extract_dim, kernel_size=3, stride=1, padding=1)  # 使用 CNN 初步提取特征
-
+        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+        self.feature_extractor = nn.Conv2d(in_channels=channels*2, out_channels=extract_dim, kernel_size=3, stride=1, padding=1)  # 使用 CNN 初步提取特征
         self.to_latent = nn.Identity()    # 这是啥
 
     def forward(self, img):
