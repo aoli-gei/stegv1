@@ -128,6 +128,7 @@ class model1_encoder(nn.Module):
             nn.Linear(patch_dim, dim),
             nn.LayerNorm(dim),
         )
+        self.pose_cnn = nn.Conv2d(in_channels=8,out_channels=3,kernel_size=3,stride=1,padding=1)
         self.pos_embedding = nn.Parameter(
             torch.randn(1, num_patches, dim))  # 位置嵌入是可学习的
         self.dropout = nn.Dropout(emb_dropout)
@@ -142,7 +143,8 @@ class model1_encoder(nn.Module):
 
     def forward(self, img):
         extract_feature = self.feature_extractor(img)
-        x = self.to_patch_embedding(extract_feature)
+        # x = self.to_patch_embedding(extract_feature)
+        x = rearrange(extract_feature,'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',p1=self.patch_size, p2=self.patch_size)
         b, n, _ = x.shape
         x += self.pos_embedding[:, :n]
         x = self.dropout(x)
@@ -151,6 +153,8 @@ class model1_encoder(nn.Module):
 
         x = rearrange(x, 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)', h=self.proportion,
                       p1=self.patch_size, p2=self.patch_size)  # 转化为图像表示，(B,C,H,W)
+        
+        x = self.pose_cnn(x)
 
         return x
 
@@ -184,6 +188,7 @@ class model1_decoder(nn.Module):
             nn.Linear(patch_dim, dim),
             nn.LayerNorm(dim),
         )
+        self.pose_cnn = nn.Conv2d(in_channels=4,out_channels=3,kernel_size=3,stride=1,padding=1)
         self.pos_embedding = nn.Parameter(
             torch.randn(1, num_patches, dim))  # 位置嵌入是可学习的？
         self.dropout = nn.Dropout(emb_dropout)
@@ -203,6 +208,7 @@ class model1_decoder(nn.Module):
 
         x = rearrange(x, 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)', h=self.proportion,
                       p1=self.patch_size, p2=self.patch_size)  # 转化为图像表示，(B,C,H,W)
+        x = self.pose_cnn(x)
 
         return x
 
